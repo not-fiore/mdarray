@@ -6,7 +6,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut, Index, IndexMut, RangeBounds};
-use std::{ptr, slice};
+use std::{ptr, result, slice};
+
+use thiserror::Error;
 
 #[cfg(not(feature = "nightly"))]
 use crate::alloc::{Allocator, Global};
@@ -60,8 +62,9 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     ///
     /// Panics if the inner dimensions do not match, if the rank is not the same and
     /// at least 1, or if the first dimension is not dynamically-sized.
-    pub fn append(&mut self, other: &mut Self) {
-        self.expand(other.drain(..));
+    pub fn append(&mut self, other: &mut Self) -> result::Result<(), TensorError> {
+        self.expand(other.drain(..)?);
+        Ok(())
     }
 
     /// Returns the number of elements the array can hold without reallocating.
@@ -74,12 +77,11 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     /// If the array type has dynamic rank, the rank is set to 1.
     ///
     /// Note that this method has no effect on the allocated capacity of the array.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the default array length for the layout mapping is not zero.
-    pub fn clear(&mut self) {
-        assert!(S::default().len() == 0, "default length not zero");
+    pub fn clear(&mut self) -> result::Result<(), TensorError> {
+        // assert!(S::default().len() == 0, "default length not zero");
+        if S::default().len() != 0 {
+            return Err(TensorError::DefaultLength(S::default().len()));
+        }
 
         unsafe {
             self.tensor.with_mut_parts(|vec, mapping| {
@@ -87,25 +89,25 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
                 *mapping = DenseMapping::default();
             });
         }
+        Ok(())
     }
 
     /// Removes the specified range from the array along the first dimension,
     /// and returns the removed range as an expression.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the rank is not at least 1, or if the first dimension
-    /// is not dynamically-sized.
-    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> IntoExpr<Drain<T, S, A>> {
-        assert!(self.rank() > 0, "invalid rank");
-        assert!(S::Head::SIZE.is_none(), "first dimension not dynamically-sized");
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> result::Result<IntoExpr<Drain<T, S, A>>, TensorError> {
+        if self.rank() == 0 {
+            return Err(TensorError::InvalidRank(self.rank()));
+        }
+        if let Some(n) = S::Head::SIZE {
+            return Err(TensorError::FirstDimNotDyn(n));
+        }
 
         #[cfg(not(feature = "nightly"))]
         let range = crate::index::range(range, ..self.dim(0));
         #[cfg(feature = "nightly")]
         let range = slice::range(range, ..self.dim(0));
 
-        IntoExpr::new(Drain::new(self, range.start, range.end))
+        Ok(IntoExpr::new(Drain::new(self, range.start, range.end)))
     }
 
     /// Appends an expression to the array along the first dimension with broadcasting,
@@ -117,9 +119,13 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     ///
     /// Panics if the inner dimensions do not match, if the rank is not the same and
     /// at least 1, or if the first dimension is not dynamically-sized.
-    pub fn expand<I: IntoExpression<Item: IntoCloned<T>>>(&mut self, expr: I) {
-        assert!(self.rank() > 0, "invalid rank");
-        assert!(S::Head::SIZE.is_none(), "first dimension not dynamically-sized");
+    pub fn expand<I: IntoExpression<Item: IntoCloned<T>>>(&mut self, expr: I) -> result::Result<(), TensorError> {
+        if self.rank() == 0 {
+            return Err(TensorError::InvalidRank(self.rank()));
+        }
+        if let Some(n) = S::Head::SIZE {
+            return Err(TensorError::FirstDimNotDyn(n));
+        }
 
         let expr = expr.into_expr();
         let len = expr.len();
@@ -372,7 +378,7 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     /// # Errors
     ///
     /// If the capacity overflows, or the allocator reports a failure, then an error is returned.
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+    pub fn try_reserve(&mut self, additional: usize) -> result::Result<(), TryReserveError> {
         unsafe { self.tensor.with_mut_parts(|vec, _| vec.try_reserve(additional)) }
     }
 
@@ -381,7 +387,7 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     /// # Errors
     ///
     /// If the capacity overflows, or the allocator reports a failure, then an error is returned.
-    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+    pub fn try_reserve_exact(&mut self, additional: usize) -> result::Result<(), TryReserveError> {
         unsafe { self.tensor.with_mut_parts(|vec, _| vec.try_reserve_exact(additional)) }
     }
 
@@ -910,7 +916,7 @@ macro_rules! impl_try_from_array {
         impl<T $(,$xyz: Dim)+ $(,const $abc: usize)+> TryFrom<Tensor<T, ($($xyz,)+)>> for $array {
             type Error = Tensor<T, ($($xyz,)+)>;
 
-            fn try_from(value: Tensor<T, ($($xyz,)+)>) -> Result<Self, Self::Error> {
+            fn try_from(value: Tensor<T, ($($xyz,)+)>) -> result::Result<Self, Self::Error> {
                 if value.shape().with_dims(|dims| dims == &[$($abc),+]) {
                     let mut vec = value.into_vec();
 
@@ -933,3 +939,15 @@ impl_try_from_array!((X, Y, Z), (A, B, C), [[[T; C]; B]; A]);
 impl_try_from_array!((X, Y, Z, W), (A, B, C, D), [[[[T; D]; C]; B]; A]);
 impl_try_from_array!((X, Y, Z, W, U), (A, B, C, D, E), [[[[[T; E]; D]; C]; B]; A]);
 impl_try_from_array!((X, Y, Z, W, U, V), (A, B, C, D, E, F), [[[[[[T; F]; E]; D]; C]; B]; A]);
+
+#[derive(Debug, Error)]
+pub enum TensorError {
+    #[error("default length not zero.")]
+    DefaultLength(usize),
+    #[error("invalid rank.")]
+    InvalidRank(usize),
+    #[error("first dimension not dynamically sized.")]
+    FirstDimNotDyn(usize),
+}
+
+// pub type Result<T> = result::Result<T, TensorError>;
