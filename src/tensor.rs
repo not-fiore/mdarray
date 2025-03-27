@@ -63,8 +63,7 @@ impl<T, S: Shape, A: Allocator> Tensor<T, S, A> {
     /// Panics if the inner dimensions do not match, if the rank is not the same and
     /// at least 1, or if the first dimension is not dynamically-sized.
     pub fn append(&mut self, other: &mut Self) -> result::Result<(), TensorError> {
-        self.expand(other.drain(..)?);
-        Ok(())
+        self.expand(other.drain(..)?)?;
     }
 
     /// Returns the number of elements the array can hold without reallocating.
